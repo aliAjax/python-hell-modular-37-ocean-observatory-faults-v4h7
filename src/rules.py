@@ -39,6 +39,10 @@ def _validate_asset(data, lookup):
         raise ValidationError("asset requires station")
     if data.get("clock_offset_seconds") not in (None, ""):
         _number(data.get("clock_offset_seconds"), "clock_offset_seconds")
+    if data.get("report_rate") not in (None, ""):
+        report_rate = _number(data.get("report_rate"), "report_rate")
+        if report_rate <= 0:
+            raise ValidationError("report_rate must be positive")
 
 
 def _validate_link(data, lookup):
@@ -46,7 +50,11 @@ def _validate_link(data, lookup):
         raise ValidationError("link requires station")
     if not _find_one(lookup, "asset", "id", data.get("asset_id")):
         raise ValidationError("link requires asset")
-    _number(data.get("capacity"), "capacity")
+    capacity = _number(data.get("capacity"), "capacity")
+    if data.get("backup_capacity") not in (None, ""):
+        backup = _number(data.get("backup_capacity"), "backup_capacity")
+        if backup > capacity:
+            raise ValidationError("backup_capacity cannot exceed capacity")
 
 
 def _validate_telemetry(data, lookup):
@@ -112,6 +120,15 @@ def _revise_telemetry(actor, entity, data, lookup):
     return {"late_revision": True, "revised_by": actor.user_id}
 
 
+def _change_incident_severity(actor, entity, data, lookup):
+    new_severity = data.get("severity")
+    if new_severity not in ("low", "medium", "high", "critical"):
+        raise ValidationError("invalid incident severity")
+    if new_severity == entity["data"].get("severity"):
+        raise ValidationError("incident severity is unchanged")
+    return {"previous_severity": entity["data"].get("severity"), "severity": new_severity, "changed_by": actor.user_id}
+
+
 def _resolve_incident(actor, entity, data, lookup):
     actions = [a for a in _all(lookup, "recovery_action") if a["data"].get("incident_id") == entity["id"] and a["status"] not in ("succeeded", "failed", "cancelled")]
     if actions:
@@ -141,12 +158,18 @@ class RuleEngine:
     ALIASES = {
         "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
-        "gaps": "gap",
+        "gaps": "gap", "allocations": "allocation",
     }
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "allocation": "normal",
     }
+    # active incidents are those that have not been resolved/closed yet
+    ACTIVE_INCIDENT_STATUSES = ("open", "diagnosing", "recovery_planned", "recovering")
+    SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, None: 0}
+    # when a link does not declare backup_capacity, the backup carries this share of capacity
+    DEFAULT_BACKUP_RATIO = 0.25
     TRANSITIONS = {
         "station": {
             "degrade": (("online",), "degraded"),
@@ -179,6 +202,10 @@ class RuleEngine:
             "resolve": (("recovering",), "resolved"),
             "close": (("resolved",), "closed"),
             "reopen": (("resolved", "closed"), "open"),
+            "change_severity": (
+                ("open", "diagnosing", "recovery_planned", "recovering"),
+                None,
+            ),
         },
         "recovery_action": {
             "approve": (("proposed",), "approved"),
@@ -217,6 +244,7 @@ class RuleEngine:
         ("mission", "complete"): ("report",),
         ("gap", "fill"): ("estimate",),
         ("incident", "resolve"): ("summary",),
+        ("incident", "change_severity"): ("severity",),
     }
     CREATE_ROLES = {
         "station": ("admin", "engineer"),
@@ -227,6 +255,8 @@ class RuleEngine:
         "recovery_action": ("admin", "operator", "engineer"),
         "mission": ("admin", "engineer"),
         "gap": ("admin", "operator", "engineer"),
+        # allocations are computed by the system, never created through the API
+        "allocation": (),
     }
     ROLE_ACTIONS = {
         "degrade": ("admin", "engineer", "operator"),
@@ -247,6 +277,7 @@ class RuleEngine:
         "resolve": ("admin", "engineer"),
         "close": ("admin", "engineer"),
         "reopen": ("admin", "engineer", "operator"),
+        "change_severity": ("admin", "engineer", "operator"),
         "approve": ("admin", "engineer"),
         "start": ("admin", "engineer", "operator"),
         "succeed": ("admin", "engineer", "operator"),
@@ -268,6 +299,7 @@ class RuleEngine:
     CUSTOM_TRANSITIONS = {
         ("telemetry", "revise"): _revise_telemetry,
         ("incident", "resolve"): _resolve_incident,
+        ("incident", "change_severity"): _change_incident_severity,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
     }
@@ -308,4 +340,132 @@ class RuleEngine:
         patch = dict(data)
         if extra:
             patch.update(extra)
+        # next_status of None means the action changes data but keeps the entity status
+        if next_status is None:
+            next_status = entity["status"]
         return next_status, patch
+
+    @staticmethod
+    def _asset_demand(asset):
+        data = asset.get("data", {})
+        rate = data.get("report_rate")
+        if rate in (None, ""):
+            return 1.0
+        return max(float(rate), 0.0)
+
+    @staticmethod
+    def _incident_applies(incident, link, asset):
+        data = incident.get("data", {})
+        asset_id = data.get("asset_id")
+        if asset_id:
+            return asset_id == asset["id"]
+        # link- and station-scoped incidents cover every asset on that link
+        link_id = data.get("link_id")
+        if link_id:
+            return link_id == link["id"]
+        station_id = data.get("station_id")
+        if station_id:
+            return station_id == link["data"].get("station_id")
+        return False
+
+    def asset_severity(self, asset, link, incidents):
+        """Highest active-incident severity affecting an asset on this link."""
+        ranks = [
+            incident["data"].get("severity")
+            for incident in incidents
+            if incident["status"] in self.ACTIVE_INCIDENT_STATUSES
+            and self._incident_applies(incident, link, asset)
+        ]
+        if not ranks:
+            return None
+        return max(ranks, key=lambda severity: self.SEVERITY_RANK.get(severity, 0))
+
+    def backup_capacity(self, link):
+        data = link.get("data", {})
+        if data.get("backup_capacity") not in (None, ""):
+            return max(float(data["backup_capacity"]), 0.0)
+        return float(data.get("capacity", 0)) * self.DEFAULT_BACKUP_RATIO
+
+    def build_backup_allocation(self, link, assets, incidents):
+        """Grant the limited backup channel by severity, highest first.
+
+        Higher-severity assets get their full report rate; when capacity runs
+        out, lower-severity assets are degraded (partial quota) or queued
+        (zero quota) so critical readings are never squeezed out.
+        """
+        capacity = round(self.backup_capacity(link), 6)
+        ranked = sorted(
+            [
+                {
+                    "asset_id": asset["id"],
+                    "severity": self.asset_severity(asset, link, incidents),
+                    "demand": self._asset_demand(asset),
+                }
+                for asset in assets
+                if asset["data"].get("station_id") == link["data"].get("station_id")
+            ],
+            key=lambda item: (-self.SEVERITY_RANK.get(item["severity"], 0), item["asset_id"]),
+        )
+        entries = []
+        remaining = capacity
+        for item in ranked:
+            quota = round(min(item["demand"], max(remaining, 0.0)), 6)
+            if quota + 1e-9 >= item["demand"]:
+                state = "active"
+            elif quota > 1e-9:
+                state = "degraded"
+            else:
+                state = "queued"
+            entries.append(
+                {
+                    "asset_id": item["asset_id"],
+                    "severity": item["severity"],
+                    "demand": round(item["demand"], 6),
+                    "quota": quota,
+                    "state": state,
+                }
+            )
+            remaining = max(remaining - item["demand"], 0.0)
+        queued = [entry for entry in entries if entry["state"] == "queued"]
+        degraded = [entry for entry in entries if entry["state"] == "degraded"]
+        # queue head is the first to be squeezed; within the same severity ids
+        # are ordered deterministically so two recomputations compare cleanly
+        for pos, entry in enumerate(sorted(degraded + queued, key=self._queue_sort_key), start=1):
+            entry["queue_position"] = pos
+        total_demand = round(sum(item["demand"] for item in ranked), 6)
+        return {
+            "mode": "backup",
+            "link_id": link["id"],
+            "capacity": capacity,
+            "total_demand": total_demand,
+            "constrained": total_demand > capacity + 1e-9,
+            "entries": entries,
+        }
+
+    @staticmethod
+    def _queue_sort_key(entry):
+        rank = RuleEngine.SEVERITY_RANK.get(entry["severity"], 0)
+        return (rank, entry["asset_id"])
+
+    def build_normal_allocation(self, link, assets):
+        """Routine allocation once the main link is restored."""
+        entries = [
+            {
+                "asset_id": asset["id"],
+                "severity": None,
+                "demand": round(self._asset_demand(asset), 6),
+                "quota": round(self._asset_demand(asset), 6),
+                "state": "active",
+            }
+            for asset in assets
+            if asset["data"].get("station_id") == link["data"].get("station_id")
+        ]
+        entries.sort(key=lambda entry: entry["asset_id"])
+        return {
+            "mode": "normal",
+            "link_id": link["id"],
+            "capacity": round(float(link["data"].get("capacity", 0)), 6),
+            "total_demand": round(sum(entry["demand"] for entry in entries), 6),
+            "constrained": False,
+            "entries": entries,
+        }

@@ -70,7 +70,10 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            if getattr(exc, "details", None) is not None:
+                payload["details"] = exc.details
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -90,8 +93,9 @@ def create_handler(service, rules, static_dir):
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
-                    status = query.get("status", [None])[0]
-                    return self._send(200, {"items": service.list(parts[1], status=status)})
+                    status = query.pop("status", [None])[0]
+                    filters = {key: values[0] for key, values in query.items() if values}
+                    return self._send(200, {"items": service.list(parts[1], status=status, filters=filters)})
                 raise NotFoundError("not found")
             except Exception as exc:
                 self._fail(exc)

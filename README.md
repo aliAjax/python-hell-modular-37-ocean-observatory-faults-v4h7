@@ -45,6 +45,17 @@ curl http://127.0.0.1:8337/health
 - 恢复动作按`dedupe_key`防止重复执行。
 - 事件解决前恢复动作、数据缺口和受影响资产必须达到可关闭状态。
 
+## 备用通道上报额度
+
+主链路中断后执行链路动作`activate_backup`切到备用通道。备用通道容量小，系统按故障事件轻重为该站各资产重新分配上报额度，额度保存在系统生成的`allocation`对象中（id为`allocation-<链路id>`）：
+
+- 资产等级取其活动故障事件（`open`/`diagnosing`/`recovery_planned`/`recovering`）的最高严重度：`critical > high > medium > low > 无事件`；链路级或站点级事件覆盖该链路下所有资产。
+- 按等级从高到低、同等级按资产id分配：额度够则`active`拿满；容量不足时低级别先`degraded`（拿剩余额度）或`queued`（额度为0，带`queue_position`排队），保证关键设备读数不被挤掉。
+- 每个资产的需求额度为`report_rate`（缺省1）；备用容量取链路的`backup_capacity`，未填写时为主链路`capacity`的25%。
+- 事件等级通过incident动作`change_severity`（数据`{"severity":"..."}`）调整；等级一变，或活动事件新建/解决/关闭/重开、备用期间新增资产，先前分配立即作废并整体重算，`epoch`递增；等级升高的设备会立刻把额度从低级别设备收回。
+- 链路执行`restore`恢复后，分配复位为`normal`模式，全部资产按主链路容量`active`上报。
+- 两名调度同时提交同一链路切换时，先写入者生效（SQLite `BEGIN IMMEDIATE` + 乐观锁）；后到者收到409，响应体`details`中带当前生效的分配，随后可通过`GET /api/allocations?link_id=<链路id>`查看。
+
 ## 测试
 
 ```bash
