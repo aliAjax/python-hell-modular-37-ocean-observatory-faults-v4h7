@@ -20,7 +20,16 @@ class NotFoundError(DomainError):
 
 
 class ConflictError(DomainError):
-    """A version or uniqueness constraint was violated."""
+    """A version or uniqueness constraint was violated.
+
+    ``current`` MAY carry the latest state when a write loses an optimistic
+    concurrency race, so the caller that arrived late can see what the
+    first write produced.
+    """
+
+    def __init__(self, message, current=None):
+        super().__init__(message)
+        self.current = current
 
 
 class InvalidTransition(DomainError):

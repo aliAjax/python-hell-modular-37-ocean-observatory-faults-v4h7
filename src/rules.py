@@ -39,6 +39,8 @@ def _validate_asset(data, lookup):
         raise ValidationError("asset requires station")
     if data.get("clock_offset_seconds") not in (None, ""):
         _number(data.get("clock_offset_seconds"), "clock_offset_seconds")
+    if data.get("reporting_rate") not in (None, ""):
+        _number(data.get("reporting_rate"), "reporting_rate")
 
 
 def _validate_link(data, lookup):
@@ -47,6 +49,8 @@ def _validate_link(data, lookup):
     if not _find_one(lookup, "asset", "id", data.get("asset_id")):
         raise ValidationError("link requires asset")
     _number(data.get("capacity"), "capacity")
+    if data.get("backup_capacity") not in (None, ""):
+        _number(data.get("backup_capacity"), "backup_capacity")
 
 
 def _validate_telemetry(data, lookup):
@@ -137,15 +141,23 @@ def _complete_mission(actor, entity, data, lookup):
     return {"completed_by": actor.user_id}
 
 
+def _change_severity(actor, entity, data, lookup):
+    severity = data.get("severity")
+    if severity not in ("low", "medium", "high", "critical"):
+        raise ValidationError("invalid incident severity")
+    return {"severity": severity, "severity_changed_by": actor.user_id}
+
+
 class RuleEngine:
     ALIASES = {
         "stations": "station", "assets": "asset", "links": "link", "telemetries": "telemetry",
         "incidents": "incident", "recovery_actions": "recovery_action", "missions": "mission",
-        "gaps": "gap",
+        "gaps": "gap", "backup_allocations": "backup_allocation",
     }
     INITIAL_STATUS = {
         "station": "online", "asset": "healthy", "link": "up", "telemetry": "current",
         "incident": "open", "recovery_action": "proposed", "mission": "planned", "gap": "open",
+        "backup_allocation": "active",
     }
     TRANSITIONS = {
         "station": {
@@ -179,6 +191,7 @@ class RuleEngine:
             "resolve": (("recovering",), "resolved"),
             "close": (("resolved",), "closed"),
             "reopen": (("resolved", "closed"), "open"),
+            "change_severity": (("open", "diagnosing", "recovery_planned", "recovering"), None),
         },
         "recovery_action": {
             "approve": (("proposed",), "approved"),
@@ -217,6 +230,7 @@ class RuleEngine:
         ("mission", "complete"): ("report",),
         ("gap", "fill"): ("estimate",),
         ("incident", "resolve"): ("summary",),
+        ("incident", "change_severity"): ("severity",),
     }
     CREATE_ROLES = {
         "station": ("admin", "engineer"),
@@ -247,6 +261,7 @@ class RuleEngine:
         "resolve": ("admin", "engineer"),
         "close": ("admin", "engineer"),
         "reopen": ("admin", "engineer", "operator"),
+        "change_severity": ("admin", "engineer", "operator"),
         "approve": ("admin", "engineer"),
         "start": ("admin", "engineer", "operator"),
         "succeed": ("admin", "engineer", "operator"),
@@ -270,6 +285,7 @@ class RuleEngine:
         ("incident", "resolve"): _resolve_incident,
         ("recovery_action", "succeed"): _complete_action,
         ("mission", "complete"): _complete_mission,
+        ("incident", "change_severity"): _change_severity,
     }
 
     def normalize_kind(self, kind):
@@ -298,6 +314,8 @@ class RuleEngine:
         if not transition:
             raise InvalidTransition("unknown action %s for %s" % (action, kind))
         allowed_statuses, next_status = transition
+        if next_status is None:
+            next_status = entity["status"]
         if entity["status"] not in allowed_statuses:
             raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
         allowed = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
